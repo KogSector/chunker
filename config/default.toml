@@ -1,0 +1,77 @@
+# Default Configuration for Chunker Service
+
+[server]
+port = 3017
+host = "0.0.0.0"
+
+[chunking]
+# Default chunk size in tokens
+chunk_size = 512
+
+# Token overlap between consecutive chunks
+chunk_overlap = 50
+
+# Minimum characters to consider as a sentence
+min_chars_per_sentence = 12
+
+# Maximum content size (bytes) for single-pass processing
+# Larger content is split at paragraph boundaries first
+max_content_size = 10485760  # 10MB
+
+[processing]
+# Maximum concurrent chunking jobs
+max_concurrent_jobs = 4
+
+# Size of chunk buffer before sending downstream
+buffer_size = 100
+
+# Continue processing remaining items if one fails
+continue_on_error = true
+
+[downstream]
+# URL of the embedding service
+# embedding_service_url = "http://localhost:3018"
+
+# URL of the graph service
+# graph_service_url = "http://localhost:3019"
+
+# Batch size for sending chunks to embedding service
+embedding_batch_size = 50
+
+[profiles]
+# Active profile name
+active = "default"
+
+[profiles.default]
+name = "default"
+description = "Default balanced profile for general use"
+chunk_size = 512
+chunk_overlap = 50
+
+[profiles.small]
+name = "small"
+description = "Smaller chunks for fine-grained retrieval"
+chunk_size = 256
+chunk_overlap = 25
+
+[profiles.large]
+name = "large"
+description = "Larger chunks for more context"
+chunk_size = 1024
+chunk_overlap = 100
+
+[profiles.code]
+name = "code"
+description = "Optimized for code with function-aware splitting"
+chunk_size = 768
+chunk_overlap = 64
+
+[logging]
+# Log level: error, warn, info, debug, trace
+level = "info"
+
+# Include timestamps
+timestamps = true
+
+# JSON format for structured logging
+json = false
