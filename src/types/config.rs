@@ -60,7 +60,7 @@ impl ChunkingConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_MIN_CHARS_PER_SENTENCE),
             embedding_service_url: std::env::var("EMBEDDING_SERVICE_URL").ok(),
-            graph_service_url: std::env::var("GRAPH_SERVICE_URL").ok(),
+            graph_service_url: std::env::var("RELATION_GRAPH_SERVICE_URL").ok(),
             max_concurrent_jobs: std::env::var("MAX_CONCURRENT_JOBS")
                 .ok()
                 .and_then(|s| s.parse().ok())
