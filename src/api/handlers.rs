@@ -14,7 +14,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::jobs::{JobProcessor, JobStore};
-use crate::output::EmbeddingClient;
+use crate::output::{EmbeddingClient, RelationGraphClient};
 use crate::router::ChunkingRouter;
 use crate::types::{
     ChunkingConfig, ChunkingProfile, StartChunkJobRequest, StartChunkJobResponse,
@@ -71,13 +71,19 @@ pub async fn start_chunk_job(
         store.create_job(items_count)
     };
 
-    // Create processor
+    // Create embedding client if configured
     let embedding_client = state.config.embedding_service_url.as_ref().map(|url| {
         Arc::new(EmbeddingClient::new(url))
     });
 
+    // Create relation-graph client if configured
+    let relation_graph_client = state.config.graph_service_url.as_ref().map(|url| {
+        info!(url = %url, "Relation-graph client enabled");
+        Arc::new(RelationGraphClient::new(url))
+    });
+
     let router = Arc::new(ChunkingRouter::new(&state.config));
-    let processor = JobProcessor::new(router, embedding_client);
+    let processor = JobProcessor::new(router, embedding_client, relation_graph_client);
 
     // Create a new job store for background processing
     // In production, you would share the actual state

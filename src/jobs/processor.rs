@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::store::JobStore;
-use crate::output::EmbeddingClient;
+use crate::output::{EmbeddingClient, RelationGraphClient};
 use crate::router::ChunkingRouter;
 use crate::types::{Chunk, SourceItem, StartChunkJobRequest};
 
@@ -15,14 +15,20 @@ use crate::types::{Chunk, SourceItem, StartChunkJobRequest};
 pub struct JobProcessor {
     router: Arc<ChunkingRouter>,
     embedding_client: Option<Arc<EmbeddingClient>>,
+    relation_graph_client: Option<Arc<RelationGraphClient>>,
 }
 
 impl JobProcessor {
     /// Create a new job processor.
-    pub fn new(router: Arc<ChunkingRouter>, embedding_client: Option<Arc<EmbeddingClient>>) -> Self {
+    pub fn new(
+        router: Arc<ChunkingRouter>,
+        embedding_client: Option<Arc<EmbeddingClient>>,
+        relation_graph_client: Option<Arc<RelationGraphClient>>,
+    ) -> Self {
         Self {
             router,
             embedding_client,
+            relation_graph_client,
         }
     }
 
@@ -77,18 +83,109 @@ impl JobProcessor {
             "Job processing complete"
         );
 
-        // Send chunks to embedding service if configured
-        if let Some(ref client) = self.embedding_client {
-            if let Err(e) = client.send_chunks(&all_chunks).await {
-                error!(job_id = %job_id, error = %e, "Failed to send chunks to embedding service");
-            }
-        }
+        // Send chunks to downstream services in PARALLEL
+        self.send_chunks_to_downstream_services(job_id, &all_chunks).await;
 
         // Mark job as completed
         {
             let mut store = job_store.write().await;
             store.complete_job(job_id);
         }
+    }
+
+    /// Send chunks to both embedding and relation-graph services in parallel.
+    async fn send_chunks_to_downstream_services(&self, job_id: Uuid, chunks: &[Chunk]) {
+        if chunks.is_empty() {
+            return;
+        }
+
+        // Clone Arcs for async move
+        let embedding_client = self.embedding_client.clone();
+        let relation_graph_client = self.relation_graph_client.clone();
+        
+        // Create owned copies of chunks for each async task
+        let chunks_for_embedding = chunks.to_vec();
+        let chunks_for_graph = chunks.to_vec();
+
+        // Send to both services in parallel using tokio::join!
+        let (embedding_result, graph_result) = tokio::join!(
+            async {
+                if let Some(client) = embedding_client {
+                    match client.send_chunks(&chunks_for_embedding).await {
+                        Ok(count) => {
+                            info!(
+                                job_id = %job_id,
+                                embedded_count = count,
+                                "Successfully sent chunks to embedding service"
+                            );
+                            Ok(count)
+                        }
+                        Err(e) => {
+                            error!(
+                                job_id = %job_id,
+                                error = %e,
+                                "Failed to send chunks to embedding service"
+                            );
+                            Err(e)
+                        }
+                    }
+                } else {
+                    Ok(0)
+                }
+            },
+            async {
+                if let Some(client) = relation_graph_client {
+                    if client.is_enabled() {
+                        match client.send_chunks(&chunks_for_graph).await {
+                            Ok(response) => {
+                                info!(
+                                    job_id = %job_id,
+                                    chunks_processed = response.chunks_processed,
+                                    entities_created = response.entities_created,
+                                    relationships_created = response.relationships_created,
+                                    "Successfully sent chunks to relation-graph service"
+                                );
+                                Ok(response)
+                            }
+                            Err(e) => {
+                                error!(
+                                    job_id = %job_id,
+                                    error = %e,
+                                    "Failed to send chunks to relation-graph service"
+                                );
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        Ok(crate::output::IngestChunksResponse {
+                            chunks_processed: 0,
+                            entities_created: 0,
+                            relationships_created: 0,
+                            errors: vec![],
+                        })
+                    }
+                } else {
+                    Ok(crate::output::IngestChunksResponse {
+                        chunks_processed: 0,
+                        entities_created: 0,
+                        relationships_created: 0,
+                        errors: vec![],
+                    })
+                }
+            }
+        );
+
+        // Log summary
+        let embedded = embedding_result.unwrap_or(0);
+        let graph_processed = graph_result.map(|r| r.chunks_processed).unwrap_or(0);
+        
+        info!(
+            job_id = %job_id,
+            chunks_total = chunks.len(),
+            chunks_embedded = embedded,
+            chunks_graphed = graph_processed,
+            "Completed sending chunks to downstream services"
+        );
     }
 
     /// Process a single source item.
