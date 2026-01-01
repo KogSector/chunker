@@ -1,448 +1,343 @@
-//! AST-aware code chunker using tree-sitter.
+//! Semantic code chunker for normalized code input.
+//!
+//! This chunker receives pre-parsed/normalized code from code-normalize-fetch
+//! and creates intelligent chunks based on the provided entity boundaries.
 
-use anyhow::{anyhow, Result};
-use tree_sitter::{Language, Node, Parser, Tree};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::base::{count_tokens, Chunker};
 use crate::types::{Chunk, ChunkConfig, ChunkMetadata, SourceItem};
 
-/// Code chunker that uses tree-sitter for AST-aware chunking.
+/// Entity boundary provided by code-normalize-fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityBoundary {
+    /// Entity name
+    pub name: String,
+    /// Entity type (function, class, method, etc.)
+    pub entity_type: String,
+    /// Start line (1-indexed)
+    pub start_line: usize,
+    /// End line (1-indexed)
+    pub end_line: usize,
+    /// Optional signature
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Code chunker that uses pre-parsed entity boundaries.
 ///
-/// This chunker parses code into an Abstract Syntax Tree and creates
-/// chunks based on semantic code units like functions, classes, and methods.
-/// This produces much better chunks for code than naive text splitting.
+/// This chunker receives normalized input from code-normalize-fetch
+/// and creates semantic chunks based on entity boundaries.
 pub struct CodeChunker {
-    /// Supported languages and their tree-sitter language bindings
-    languages: std::collections::HashMap<String, Language>,
+    /// Languages supported for semantic chunking
+    supported_languages: Vec<String>,
 }
 
 impl CodeChunker {
-    /// Create a new code chunker with all supported languages.
+    /// Create a new code chunker.
     pub fn new() -> Self {
-        let mut languages = std::collections::HashMap::new();
-
-        // Register all supported languages
-        languages.insert("rust".to_string(), tree_sitter_rust::language());
-        languages.insert("rs".to_string(), tree_sitter_rust::language());
-        languages.insert("python".to_string(), tree_sitter_python::language());
-        languages.insert("py".to_string(), tree_sitter_python::language());
-        languages.insert("javascript".to_string(), tree_sitter_javascript::language());
-        languages.insert("js".to_string(), tree_sitter_javascript::language());
-        languages.insert("jsx".to_string(), tree_sitter_javascript::language());
-        languages.insert("typescript".to_string(), tree_sitter_typescript::language_typescript());
-        languages.insert("ts".to_string(), tree_sitter_typescript::language_typescript());
-        languages.insert("tsx".to_string(), tree_sitter_typescript::language_tsx());
-        languages.insert("go".to_string(), tree_sitter_go::language());
-        languages.insert("c".to_string(), tree_sitter_c::language());
-        languages.insert("cpp".to_string(), tree_sitter_cpp::language());
-        languages.insert("c++".to_string(), tree_sitter_cpp::language());
-        languages.insert("java".to_string(), tree_sitter_java::language());
-        languages.insert("ruby".to_string(), tree_sitter_ruby::language());
-        languages.insert("rb".to_string(), tree_sitter_ruby::language());
-
-        Self { languages }
-    }
-
-    /// Get the tree-sitter language for the given language identifier.
-    fn get_language(&self, lang: &str) -> Option<&Language> {
-        self.languages.get(&lang.to_lowercase())
-    }
-
-    /// Parse code with tree-sitter.
-    fn parse_code(&self, code: &str, language: &Language) -> Result<Tree> {
-        let mut parser = Parser::new();
-        parser.set_language(language)?;
-
-        parser
-            .parse(code.as_bytes(), None)
-            .ok_or_else(|| anyhow!("Failed to parse code"))
-    }
-
-    /// Get the node types that represent points of interest for chunking.
-    fn get_chunk_node_types(language: &str) -> Vec<&'static str> {
-        match language.to_lowercase().as_str() {
-            "rust" | "rs" => vec![
-                "function_item",
-                "impl_item",
-                "struct_item",
-                "enum_item",
-                "trait_item",
-                "mod_item",
-                "const_item",
-                "static_item",
-                "type_item",
-            ],
-            "python" | "py" => vec![
-                "function_definition",
-                "class_definition",
-                "decorated_definition",
-            ],
-            "javascript" | "js" | "jsx" => vec![
-                "function_declaration",
-                "class_declaration",
-                "arrow_function",
-                "method_definition",
-                "export_statement",
-            ],
-            "typescript" | "ts" | "tsx" => vec![
-                "function_declaration",
-                "class_declaration",
-                "arrow_function",
-                "method_definition",
-                "interface_declaration",
-                "type_alias_declaration",
-                "export_statement",
-            ],
-            "go" => vec![
-                "function_declaration",
-                "method_declaration",
-                "type_declaration",
-                "const_declaration",
-                "var_declaration",
-            ],
-            "java" => vec![
-                "class_declaration",
-                "method_declaration",
-                "interface_declaration",
-                "constructor_declaration",
-            ],
-            "c" | "cpp" | "c++" => vec![
-                "function_definition",
-                "struct_specifier",
-                "class_specifier",
-                "namespace_definition",
-            ],
-            "ruby" | "rb" => vec![
-                "method",
-                "class",
-                "module",
-                "singleton_method",
-            ],
-            _ => vec!["function", "class", "method"],
+        Self {
+            supported_languages: vec![
+                "python", "javascript", "typescript", "rust", "go",
+                "java", "c", "cpp", "ruby", "tsx", "jsx",
+            ].into_iter().map(String::from).collect(),
         }
     }
 
-    /// Collect all nodes of interest from the AST.
-    fn collect_chunk_nodes<'a>(
+    /// Chunk code with entity boundaries from code-normalize-fetch.
+    pub fn chunk_with_entities(
         &self,
-        node: Node<'a>,
-        chunk_types: &[&str],
-        nodes: &mut Vec<Node<'a>>,
-    ) {
-        if chunk_types.contains(&node.kind()) {
-            nodes.push(node);
-        } else {
-            // Recurse into children
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                self.collect_chunk_nodes(child, chunk_types, nodes);
-            }
-        }
-    }
-
-    /// Extract text for a node, including any preceding comments.
-    fn extract_node_text<'a>(
-        &self,
-        node: Node<'a>,
-        source: &'a [u8],
-        tree: &'a Tree,
-    ) -> (String, usize, usize) {
-        // Look for preceding comments or decorators
-        let mut start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-
-        // Walk backwards to find attached comments
-        if let Some(prev) = self.find_preceding_comment(node, tree) {
-            start_byte = prev.start_byte();
-        }
-
-        let text = String::from_utf8_lossy(&source[start_byte..end_byte]).to_string();
-        let start_line = node.start_position().row + 1;
-        let end_line = node.end_position().row + 1;
-
-        (text, start_line, end_line)
-    }
-
-    /// Find a comment node immediately preceding the given node.
-    fn find_preceding_comment<'a>(&self, node: Node<'a>, _tree: &'a Tree) -> Option<Node<'a>> {
-        let mut prev = node.prev_sibling();
-
-        while let Some(p) = prev {
-            if p.kind().contains("comment") {
-                return Some(p);
-            } else if p.kind() == "decorated_definition" || p.kind().contains("decorator") {
-                // Include decorators (Python)
-                return Some(p);
-            } else if !p.kind().trim().is_empty() {
-                // Non-empty, non-comment node found
-                break;
-            }
-            prev = p.prev_sibling();
-        }
-
-        None
-    }
-
-    /// Group nodes into chunks that fit within token limits.
-    fn group_nodes_into_chunks<'a>(
-        &self,
-        nodes: Vec<Node<'a>>,
-        source: &'a [u8],
-        tree: &'a Tree,
-        chunk_size: usize,
         item: &SourceItem,
-        language: &str,
-    ) -> Vec<Chunk> {
+        config: &ChunkConfig,
+        entities: &[EntityBoundary],
+    ) -> Result<Vec<Chunk>> {
+        let content = &item.content;
+        let lines: Vec<&str> = content.lines().collect();
+        let chunk_size = config.chunk_size;
+        let overlap = config.chunk_overlap;
+        let language = item.extract_language().unwrap_or("unknown");
+
+        if entities.is_empty() {
+            // No entities provided, fall back to line-based chunking
+            return self.fallback_chunk(item, config, language);
+        }
+
         let mut chunks = Vec::new();
-        let mut current_nodes: Vec<(String, usize, usize)> = Vec::new();
-        let mut current_tokens = 0;
         let mut chunk_index = 0;
 
-        for node in nodes {
-            let (text, start_line, end_line) = self.extract_node_text(node, source, tree);
-            let node_tokens = count_tokens(&text);
+        for entity in entities {
+            let start_idx = entity.start_line.saturating_sub(1);
+            let end_idx = entity.end_line.min(lines.len());
 
-            // If single node exceeds chunk size, we need to handle it specially
-            if node_tokens > chunk_size {
-                // First, flush current accumulated nodes
-                if !current_nodes.is_empty() {
-                    let chunk = self.create_chunk_from_nodes(
-                        &current_nodes,
-                        item,
-                        chunk_index,
-                        language,
-                    );
-                    chunks.push(chunk);
-                    chunk_index += 1;
-                    current_nodes.clear();
-                    current_tokens = 0;
-                }
+            if start_idx >= lines.len() || start_idx >= end_idx {
+                continue;
+            }
 
-                // Add the large node as its own chunk(s)
-                // For very large functions, we might need to split them
-                let large_chunks = self.split_large_node(
-                    &text,
-                    start_line,
-                    end_line,
-                    chunk_size,
-                    item,
-                    &mut chunk_index,
-                    language,
-                );
-                chunks.extend(large_chunks);
-            } else if current_tokens + node_tokens > chunk_size {
-                // Current chunk is full, start a new one
-                let chunk = self.create_chunk_from_nodes(
-                    &current_nodes,
+            let entity_text: String = lines[start_idx..end_idx].join("\n");
+            let token_count = count_tokens(&entity_text);
+
+            if token_count <= chunk_size {
+                // Entity fits in one chunk
+                let chunk = self.create_chunk(
+                    &entity_text,
+                    entity.start_line,
+                    entity.end_line,
                     item,
                     chunk_index,
                     language,
+                    Some(&entity.name),
+                    Some(&entity.entity_type),
                 );
                 chunks.push(chunk);
                 chunk_index += 1;
-
-                current_nodes = vec![(text, start_line, end_line)];
-                current_tokens = node_tokens;
             } else {
-                // Add to current chunk
-                current_nodes.push((text, start_line, end_line));
-                current_tokens += node_tokens;
+                // Entity too large, split it
+                let sub_chunks = self.split_large_entity(
+                    &entity_text,
+                    entity.start_line,
+                    chunk_size,
+                    overlap,
+                    item,
+                    &mut chunk_index,
+                    language,
+                    &entity.name,
+                    &entity.entity_type,
+                );
+                chunks.extend(sub_chunks);
             }
         }
 
-        // Don't forget the last chunk
-        if !current_nodes.is_empty() {
-            let chunk = self.create_chunk_from_nodes(
-                &current_nodes,
-                item,
-                chunk_index,
-                language,
-            );
-            chunks.push(chunk);
-        }
+        // Handle any gaps between entities
+        let covered_lines = self.get_covered_lines(entities, lines.len());
+        let gap_chunks = self.chunk_gaps(&lines, &covered_lines, item, &mut chunk_index, config, language);
+        chunks.extend(gap_chunks);
 
-        chunks
+        // Sort chunks by start line
+        chunks.sort_by_key(|c| c.metadata.line_range.map(|(s, _)| s).unwrap_or(0));
+
+        Ok(chunks)
     }
 
-    /// Create a chunk from accumulated node texts.
-    fn create_chunk_from_nodes(
-        &self,
-        nodes: &[(String, usize, usize)],
-        item: &SourceItem,
-        chunk_index: usize,
-        language: &str,
-    ) -> Chunk {
-        let content: String = nodes.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>().join("\n\n");
-        let token_count = count_tokens(&content);
-
-        let start_line = nodes.first().map(|(_, s, _)| *s).unwrap_or(1);
-        let end_line = nodes.last().map(|(_, _, e)| *e).unwrap_or(1);
-
-        // Calculate character positions (approximate)
-        let start_index = 0; // Would need to track properly
-        let end_index = content.len();
-
-        let mut chunk = Chunk::new(
-            item.id,
-            item.source_id,
-            item.source_kind,
-            content,
-            token_count,
-            start_index,
-            end_index,
-            chunk_index,
-        );
-
-        // Add code-specific metadata
-        chunk.metadata = ChunkMetadata::for_code(language, item.extract_path())
-            .with_lines(start_line, end_line);
-
-        chunk
-    }
-
-    /// Split a large node (e.g., a huge function) into smaller chunks.
-    fn split_large_node(
+    /// Create a chunk from text.
+    fn create_chunk(
         &self,
         text: &str,
         start_line: usize,
         end_line: usize,
+        item: &SourceItem,
+        chunk_index: usize,
+        language: &str,
+        entity_name: Option<&str>,
+        entity_type: Option<&str>,
+    ) -> Chunk {
+        let path = item.extract_path().unwrap_or("unknown");
+        let token_count = count_tokens(text);
+        
+        let metadata = ChunkMetadata {
+            content_type: entity_type.map(String::from),
+            language: Some(language.to_string()),
+            path: Some(path.to_string()),
+            section: None,
+            symbol_name: entity_name.map(String::from),
+            parent_symbol: None,
+            line_range: Some((start_line, end_line)),
+            author: None,
+            thread_id: None,
+            timestamp: None,
+            extra: None,
+        };
+
+        Chunk::new(
+            item.id,
+            item.source_id,
+            item.source_kind,
+            text.to_string(),
+            token_count,
+            0, // start_index not tracked at line level
+            text.len(),
+            chunk_index,
+        ).with_metadata(metadata)
+    }
+
+    /// Split a large entity into multiple chunks.
+    fn split_large_entity(
+        &self,
+        text: &str,
+        base_start_line: usize,
         chunk_size: usize,
+        overlap: usize,
         item: &SourceItem,
         chunk_index: &mut usize,
         language: &str,
+        entity_name: &str,
+        entity_type: &str,
     ) -> Vec<Chunk> {
-        let mut chunks = Vec::new();
         let lines: Vec<&str> = text.lines().collect();
-        let mut current_text = String::new();
-        let mut current_start = start_line;
+        let mut chunks = Vec::new();
+        let mut start = 0;
 
-        for (i, line) in lines.iter().enumerate() {
-            let test_text = if current_text.is_empty() {
-                line.to_string()
-            } else {
-                format!("{}\n{}", current_text, line)
-            };
+        while start < lines.len() {
+            // Find end point based on token count
+            let mut end = start;
+            let mut accumulated = String::new();
 
-            if count_tokens(&test_text) > chunk_size && !current_text.is_empty() {
-                // Create chunk from current text
-                let token_count = count_tokens(&current_text);
-                let current_end = start_line + i - 1;
-
-                let mut chunk = Chunk::new(
-                    item.id,
-                    item.source_id,
-                    item.source_kind,
-                    current_text.clone(),
-                    token_count,
-                    0,
-                    current_text.len(),
-                    *chunk_index,
-                );
-
-                chunk.metadata = ChunkMetadata::for_code(language, item.extract_path())
-                    .with_lines(current_start, current_end);
-
-                chunks.push(chunk);
-                *chunk_index += 1;
-
-                current_text = line.to_string();
-                current_start = start_line + i;
-            } else {
-                current_text = test_text;
+            while end < lines.len() && count_tokens(&accumulated) < chunk_size {
+                accumulated.push_str(lines[end]);
+                accumulated.push('\n');
+                end += 1;
             }
-        }
 
-        // Last chunk
-        if !current_text.is_empty() {
-            let token_count = count_tokens(&current_text);
+            // Ensure we make progress
+            if end == start {
+                end = start + 1;
+            }
 
-            let mut chunk = Chunk::new(
-                item.id,
-                item.source_id,
-                item.source_kind,
-                current_text.clone(),
-                token_count,
-                0,
-                current_text.len(),
+            let chunk_text = lines[start..end].join("\n");
+            let chunk_start_line = base_start_line + start;
+            let chunk_end_line = base_start_line + end - 1;
+
+            let chunk = self.create_chunk(
+                &chunk_text,
+                chunk_start_line,
+                chunk_end_line,
+                item,
                 *chunk_index,
+                language,
+                Some(entity_name),
+                Some(entity_type),
             );
-
-            chunk.metadata = ChunkMetadata::for_code(language, item.extract_path())
-                .with_lines(current_start, end_line);
-
             chunks.push(chunk);
             *chunk_index += 1;
+
+            // Move start with overlap
+            let overlap_lines = (overlap as f32 / 10.0).ceil() as usize;
+            let next_start = end.saturating_sub(overlap_lines.min(end - start));
+            start = if next_start <= start { end } else { next_start };
         }
 
         chunks
     }
 
-    /// Fallback: simple line-based chunking when parsing fails.
-    fn fallback_chunk(&self, item: &SourceItem, config: &ChunkConfig, language: &str) -> Vec<Chunk> {
-        let lines: Vec<&str> = item.content.lines().collect();
+    /// Get set of covered line indices.
+    fn get_covered_lines(&self, entities: &[EntityBoundary], total_lines: usize) -> Vec<bool> {
+        let mut covered = vec![false; total_lines];
+        for entity in entities {
+            let start = entity.start_line.saturating_sub(1);
+            let end = entity.end_line.min(total_lines);
+            for i in start..end {
+                covered[i] = true;
+            }
+        }
+        covered
+    }
+
+    /// Chunk gaps between entities.
+    fn chunk_gaps(
+        &self,
+        lines: &[&str],
+        covered: &[bool],
+        item: &SourceItem,
+        chunk_index: &mut usize,
+        _config: &ChunkConfig,
+        language: &str,
+    ) -> Vec<Chunk> {
         let mut chunks = Vec::new();
-        let mut current_lines = Vec::new();
-        let mut current_tokens = 0;
-        let mut chunk_index = 0;
-        let mut start_line = 1;
+        let mut gap_start: Option<usize> = None;
 
-        for (i, line) in lines.iter().enumerate() {
-            let line_tokens = count_tokens(line);
-
-            if current_tokens + line_tokens > config.chunk_size && !current_lines.is_empty() {
-                let content = current_lines.join("\n");
-                let token_count = count_tokens(&content);
-                let end_line = i;
-
-                let mut chunk = Chunk::new(
-                    item.id,
-                    item.source_id,
-                    item.source_kind,
-                    content.clone(),
-                    token_count,
-                    0,
-                    content.len(),
-                    chunk_index,
-                );
-
-                chunk.metadata = ChunkMetadata::for_code(language, item.extract_path())
-                    .with_lines(start_line, end_line);
-
-                chunks.push(chunk);
-                chunk_index += 1;
-                current_lines = vec![*line];
-                current_tokens = line_tokens;
-                start_line = i + 1;
-            } else {
-                current_lines.push(*line);
-                current_tokens += line_tokens;
+        for (i, &is_covered) in covered.iter().enumerate() {
+            if !is_covered {
+                if gap_start.is_none() {
+                    gap_start = Some(i);
+                }
+            } else if let Some(start) = gap_start {
+                // End of gap
+                let gap_text: String = lines[start..i].join("\n");
+                if count_tokens(&gap_text) > 10 { // Only chunk meaningful gaps
+                    let chunk = self.create_chunk(
+                        &gap_text,
+                        start + 1,
+                        i,
+                        item,
+                        *chunk_index,
+                        language,
+                        None,
+                        None,
+                    );
+                    chunks.push(chunk);
+                    *chunk_index += 1;
+                }
+                gap_start = None;
             }
         }
 
-        // Last chunk
-        if !current_lines.is_empty() {
-            let content = current_lines.join("\n");
-            let token_count = count_tokens(&content);
-            let end_line = lines.len();
-
-            let mut chunk = Chunk::new(
-                item.id,
-                item.source_id,
-                item.source_kind,
-                content.clone(),
-                token_count,
-                0,
-                content.len(),
-                chunk_index,
-            );
-
-            chunk.metadata = ChunkMetadata::for_code(language, item.extract_path())
-                .with_lines(start_line, end_line);
-
-            chunks.push(chunk);
+        // Handle trailing gap
+        if let Some(start) = gap_start {
+            let gap_text: String = lines[start..].join("\n");
+            if count_tokens(&gap_text) > 10 {
+                let chunk = self.create_chunk(
+                    &gap_text,
+                    start + 1,
+                    lines.len(),
+                    item,
+                    *chunk_index,
+                    language,
+                    None,
+                    None,
+                );
+                chunks.push(chunk);
+                *chunk_index += 1;
+            }
         }
 
         chunks
+    }
+
+    /// Fallback: simple line-based chunking when no entities provided.
+    fn fallback_chunk(&self, item: &SourceItem, config: &ChunkConfig, language: &str) -> Result<Vec<Chunk>> {
+        let content = &item.content;
+        let lines: Vec<&str> = content.lines().collect();
+        let chunk_size = config.chunk_size;
+        let overlap = config.chunk_overlap;
+
+        let mut chunks = Vec::new();
+        let mut chunk_index = 0;
+        let mut start = 0;
+
+        while start < lines.len() {
+            let mut end = start;
+            let mut accumulated = String::new();
+
+            while end < lines.len() && count_tokens(&accumulated) < chunk_size {
+                accumulated.push_str(lines[end]);
+                accumulated.push('\n');
+                end += 1;
+            }
+
+            if end == start {
+                end = start + 1;
+            }
+
+            let chunk_text = lines[start..end].join("\n");
+            let chunk = self.create_chunk(
+                &chunk_text,
+                start + 1,
+                end,
+                item,
+                chunk_index,
+                language,
+                None,
+                None,
+            );
+            chunks.push(chunk);
+            chunk_index += 1;
+
+            let overlap_lines = (overlap as f32 / 10.0).ceil() as usize;
+            let next_start = end.saturating_sub(overlap_lines.min(end - start));
+            start = if next_start <= start { end } else { next_start };
+        }
+
+        Ok(chunks)
     }
 }
 
@@ -458,81 +353,20 @@ impl Chunker for CodeChunker {
     }
 
     fn description(&self) -> &'static str {
-        "AST-aware code chunker using tree-sitter for semantic code splitting"
+        "Semantic code chunker that uses entity boundaries from code-normalize-fetch"
     }
 
     fn supports_language(&self, language: Option<&str>) -> bool {
         match language {
-            Some(lang) => self.get_language(lang).is_some(),
-            None => false,
+            Some(lang) => self.supported_languages.iter().any(|l| l == lang),
+            None => true,
         }
     }
 
     fn chunk(&self, item: &SourceItem, config: &ChunkConfig) -> Result<Vec<Chunk>> {
-        let content = &item.content;
-        if content.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Determine the language
-        let language = config.language.as_deref()
-            .or_else(|| item.extract_language())
-            .unwrap_or("text");
-
-        // Get tree-sitter language
-        let ts_language = match self.get_language(language) {
-            Some(lang) => lang,
-            None => {
-                // Fallback to line-based chunking for unsupported languages
-                return Ok(self.fallback_chunk(item, config, language));
-            }
-        };
-
-        // Parse the code
-        let tree = match self.parse_code(content, ts_language) {
-            Ok(t) => t,
-            Err(_) => {
-                // Fallback if parsing fails
-                return Ok(self.fallback_chunk(item, config, language));
-            }
-        };
-
-        let root_node = tree.root_node();
-
-        // Check for parse errors
-        if root_node.has_error() {
-            // Try to chunk anyway, but note the error
-            tracing::warn!("Code has syntax errors, chunking may be imprecise");
-        }
-
-        // Collect nodes of interest
-        let chunk_types = Self::get_chunk_node_types(language);
-        let mut nodes = Vec::new();
-        self.collect_chunk_nodes(root_node, &chunk_types, &mut nodes);
-
-        // If no suitable nodes found, use top-level children
-        if nodes.is_empty() {
-            let mut cursor = root_node.walk();
-            nodes = root_node.children(&mut cursor).collect();
-        }
-
-        // If still no nodes, fallback
-        if nodes.is_empty() {
-            return Ok(self.fallback_chunk(item, config, language));
-        }
-
-        // Group nodes into chunks
-        let source = content.as_bytes();
-        let chunks = self.group_nodes_into_chunks(
-            nodes,
-            source,
-            &tree,
-            config.chunk_size,
-            item,
-            language,
-        );
-
-        Ok(chunks)
+        // When called without entities, use fallback
+        let language = item.extract_language().unwrap_or("unknown");
+        self.fallback_chunk(item, config, language)
     }
 }
 
@@ -543,59 +377,71 @@ mod tests {
     use uuid::Uuid;
 
     fn create_code_item(content: &str, language: &str) -> SourceItem {
+        let metadata = serde_json::json!({
+            "language": language,
+            "path": "test.py"
+        });
+        
         SourceItem {
             id: Uuid::new_v4(),
             source_id: Uuid::new_v4(),
             source_kind: SourceKind::CodeRepo,
             content_type: format!("text/code:{}", language),
             content: content.to_string(),
-            metadata: serde_json::json!({"path": "test.rs", "language": language}),
+            metadata,
             created_at: None,
         }
     }
 
     #[test]
-    fn test_rust_function_chunking() {
+    fn test_chunk_with_entities() {
         let chunker = CodeChunker::new();
-        let code = r#"
-fn hello() {
-    println!("Hello, world!");
-}
+        let config = ChunkConfig::default();
+        
+        let code = r#"import os
 
-fn goodbye() {
-    println!("Goodbye, world!");
-}
-"#;
-        let item = create_code_item(code, "rust");
-        let config = ChunkConfig::with_size(1000);
-
-        let chunks = chunker.chunk(&item, &config).unwrap();
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn test_python_function_chunking() {
-        let chunker = CodeChunker::new();
-        let code = r#"
 def hello():
-    print("Hello, world!")
+    print("Hello")
 
-def goodbye():
-    print("Goodbye, world!")
+def world():
+    print("World")
 "#;
         let item = create_code_item(code, "python");
-        let config = ChunkConfig::with_size(1000);
+        
+        let entities = vec![
+            EntityBoundary {
+                name: "hello".to_string(),
+                entity_type: "function".to_string(),
+                start_line: 3,
+                end_line: 4,
+                signature: Some("def hello()".to_string()),
+            },
+            EntityBoundary {
+                name: "world".to_string(),
+                entity_type: "function".to_string(),
+                start_line: 6,
+                end_line: 7,
+                signature: Some("def world()".to_string()),
+            },
+        ];
 
-        let chunks = chunker.chunk(&item, &config).unwrap();
+        let chunks = chunker.chunk_with_entities(&item, &config, &entities).unwrap();
+        
         assert!(!chunks.is_empty());
+        assert!(chunks.iter().any(|c| c.content.contains("hello")));
+        assert!(chunks.iter().any(|c| c.content.contains("world")));
     }
 
     #[test]
-    fn test_language_support() {
+    fn test_fallback_chunking() {
         let chunker = CodeChunker::new();
-        assert!(chunker.supports_language(Some("rust")));
-        assert!(chunker.supports_language(Some("python")));
-        assert!(chunker.supports_language(Some("javascript")));
-        assert!(!chunker.supports_language(Some("unknown_lang")));
+        let config = ChunkConfig::default();
+        
+        let code = "line1\nline2\nline3\nline4\nline5";
+        let item = create_code_item(code, "unknown");
+
+        let chunks = chunker.chunk(&item, &config).unwrap();
+        
+        assert!(!chunks.is_empty());
     }
 }

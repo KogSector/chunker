@@ -3,19 +3,16 @@
 //! A high-performance, production-ready chunking service for RAG pipelines.
 //! Supports multiple content types including code, documents, chat, and tickets.
 //!
-//! Includes:
-//! - File processing with language detection
-//! - AST parsing and entity extraction
-//! - Context enrichment for embeddings
+//! The chunker receives normalized input from code-normalize-fetch service
+//! (which handles language detection, AST parsing, entity extraction) and
+//! focuses solely on intelligent chunking.
 
 pub mod api;
-pub mod ast_engine;
 pub mod batch;
 pub mod chunkers;
 pub mod enrichment;
 pub mod jobs;
 pub mod output;
-pub mod processing;
 pub mod router;
 pub mod types;
 
@@ -24,8 +21,6 @@ pub use chunkers::{Chunker, AgenticChunker};
 pub use chunkers::repo_chunker::{RepositoryContext, Symbol, SymbolType, extract_symbols};
 pub use router::ChunkingRouter;
 pub use batch::{BatchProcessor, BatchConfig, BatchResult};
-pub use processing::{FileProcessor, Language, LanguageInfo, ProcessableFile};
-pub use ast_engine::{AstParser, ParsedFile, CodeEntity, EntityType, ScopeTree};
 pub use enrichment::{ContextBuilder, ChunkContext, EnrichedChunk};
 
 /// Re-export commonly used types
@@ -35,8 +30,6 @@ pub mod prelude {
     pub use crate::chunkers::repo_chunker::*;
     pub use crate::router::ChunkingRouter;
     pub use crate::batch::*;
-    pub use crate::processing::*;
-    pub use crate::ast_engine::*;
     pub use crate::enrichment::*;
 }
 
@@ -51,4 +44,3 @@ pub const DEFAULT_MIN_CHARS_PER_SENTENCE: usize = 12;
 
 /// Maximum content size for single-pass processing (10MB)
 pub const DEFAULT_MAX_CONTENT_SIZE: usize = 10 * 1024 * 1024;
-
