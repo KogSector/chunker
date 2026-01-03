@@ -57,6 +57,12 @@ lazy_static = "1.4"
 # Unicode text processing
 unicode-segmentation = "1.10"
 
+# Message Queues
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"] }
+lapin = "2.3"                    # RabbitMQ AMQP client
+deadpool-lapin = "0.11"          # Connection pooling for RabbitMQ
+tokio-stream = "0.1"             # Stream utilities for async consumers
+
 [dev-dependencies]
 tokio-test = "0.4"
 pretty_assertions = "1.4"
